@@ -1,3 +1,27 @@
+## v6.2.2 -- Evolution Circuit Breaker Fix + Model Configuration
+
+### Critical Fixes
+- **Circuit breaker**: Increased threshold from 3 to 5 consecutive failures to handle free model temporary unavailability
+- **Model configuration**: Replaced invalid 'openrouter/free' with working 'microsoft/phi-4:free'
+- **Evolution unblock**: Now evolution can continue even when free models have temporary quota issues
+
+### Identity Updates
+- Added 'free-model-availability' knowledge topic
+- Updated scratchpad with circuit breaker strategy
+
+### Version
+- VERSION: 6.2.2 (patch update for critical fixes)
+
+### Related Changes
+- Fixed circuit breaker in supervisor/queue.py
+- Updated model configs across all files
+- Added knowledge base topic for free model patterns
+
+### Next Steps
+- Test evolution with new circuit breaker
+- Continue development with protected evolution flow
+- Monitor free model availability patterns
+
 ## v6.2.1 -- Zero-Budget Operation Knowledge Base + Ly Dialogue Integration
 
 ### Knowledge Base Additions
