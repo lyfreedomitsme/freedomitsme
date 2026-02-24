@@ -378,7 +378,7 @@ def queue_review_task(reason: str, force: bool = False) -> Optional[str]:
 def enqueue_evolution_task_if_needed() -> None:
     """Enqueue evolution task if queue is empty and evolution mode is enabled.
 
-    Circuit breaker: pauses evolution after 3 consecutive failures to prevent
+    Circuit breaker: pauses evolution after 5 consecutive failures to prevent
     burning budget on infinite retry loops.
     """
     if PENDING or RUNNING:
@@ -392,7 +392,7 @@ def enqueue_evolution_task_if_needed() -> None:
 
     # Circuit breaker: check for consecutive evolution failures
     consecutive_failures = int(st.get("evolution_consecutive_failures") or 0)
-    if consecutive_failures >= 3:
+    if consecutive_failures >= 5:
         st["evolution_mode_enabled"] = False
         save_state(st)
         send_with_budget(
