@@ -101,9 +101,9 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
         cost = float(evt.get("cost_usd") or 0)
         rounds = int(evt.get("total_rounds") or 0)
 
-        # Heuristic: if cost > $0.10 and rounds >= 1, consider it successful
-        # Empty responses typically cost < $0.01 and have 0-1 rounds
-        if cost > 0.10 and rounds >= 1:
+        # Heuristic: if rounds >= 3, consider it successful (cost-agnostic for free models)
+        # Empty responses typically have 0-2 rounds regardless of cost
+        if rounds >= 3:
             # Success: reset failure counter
             st["evolution_consecutive_failures"] = 0
             ctx.save_state(st)
