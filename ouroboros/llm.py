@@ -16,6 +16,50 @@ log = logging.getLogger(__name__)
 
 DEFAULT_LIGHT_MODEL = "google/gemini-3-pro-preview"
 
+# Known working free models for survival mode
+SURVIVAL_MODE_MODELS = [
+    "google/gemini-2.0-flash-exp:free",
+    "deepseek/deepseek-r1:free",
+    "microsoft/phi-4:free",
+    "meta-llama/llama-4-maverick:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free"
+]
+
+FREE_MODEL_PRIORITY = {
+    "google/gemini-2.0-flash-exp:free": 1,
+    "deepseek/deepseek-r1:free": 2,
+    "microsoft/phi-4:free": 3,
+    "meta-llama/llama-4-maverick:free": 4,
+    "mistralai/mistral-small-3.1-24b-instruct:free": 5
+}
+
+class BudgetTracker:
+    """Track budget and warn when approaching limits."""
+    
+    def __init__(self, budget_remaining: float = 1000.0):
+        self.budget_remaining = budget_remaining
+        self.spent_today = 0.0
+        self.warning_threshold = 0.2 * budget_remaining
+        self.critical_threshold = 0.05 * budget_remaining
+        
+    def update(self, cost: float) -> bool:
+        """Update budget with cost and return True if still within limits."""
+        self.budget_remaining -= cost
+        self.spent_today += cost
+        
+        if self.budget_remaining < self.critical_threshold:
+            log.warning(f"CRITICAL: Budget < 5%% remaining: ${self.budget_remaining:.2f}")
+            return False
+        elif self.budget_remaining < self.warning_threshold:
+            log.warning(f"WARNING: Budget < 20%% remaining: ${self.budget_remaining:.2f}")
+            return True
+        return True
+
+    def get_survival_mode(self) -> bool:
+        """Return True if we should activate survival mode."""
+        return self.budget_remaining < 1.0
+
+budget_tracker = BudgetTracker()
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
     allowed = {"none", "minimal", "low", "medium", "high", "xhigh"}
@@ -34,6 +78,9 @@ def add_usage(total: Dict[str, Any], usage: Dict[str, Any]) -> None:
         total[k] = int(total.get(k) or 0) + int(usage.get(k) or 0)
     if usage.get("cost"):
         total["cost"] = float(total.get("cost") or 0) + float(usage["cost"])
+        # Update budget tracker
+        if not budget_tracker.update(float(usage["cost"])):
+            log.warning("Budget exhausted. Activating survival mode.")
 
 
 def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
@@ -102,6 +149,22 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
         return {}
 
 
+def get_best_free_model() -> str:
+    """Return the best available free model based on priority."""
+    # Check if we have a preferred free model in env
+    env_model = os.environ.get("OUROBOROS_MODEL_FREE_PREFERRED")
+    if env_model and env_model in SURVIVAL_MODE_MODELS:
+        return env_model
+    
+    # Otherwise pick the highest priority available model
+    for model in sorted(SURVIVAL_MODE_MODELS, key=lambda m: FREE_MODEL_PRIORITY.get(m, 10)):
+        if model in fetch_openrouter_pricing():
+            return model
+    
+    # Fallback to first available
+    return SURVIVAL_MODE_MODELS[0]
+
+
 class LLMClient:
     """OpenRouter API wrapper. All LLM calls go through this class."""
 
@@ -109,11 +172,13 @@ class LLMClient:
         self,
         api_key: Optional[str] = None,
         base_url: str = "https://openrouter.ai/api/v1",
+        budget_remaining: float = 1000.0,
     ):
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self._base_url = base_url
         self._client = None
-
+        self.budget_tracker = BudgetTracker(budget_remaining)
+        
     def _get_client(self):
         if self._client is None:
             from openai import OpenAI
@@ -151,6 +216,13 @@ class LLMClient:
             pass
         return None
 
+    def _select_model(self, preferred_model: str) -> str:
+        """Select appropriate model based on budget and survival mode."""
+        if self.budget_tracker.get_survival_mode():
+            log.info("Survival mode activated: switching to free model")
+            return get_best_free_model()
+        return preferred_model
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -161,6 +233,10 @@ class LLMClient:
         tool_choice: str = "auto",
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Single LLM call. Returns: (response_message_dict, usage_dict with cost)."""
+        
+        # Select appropriate model based on budget
+        model = self._select_model(model)
+        
         client = self._get_client()
         effort = normalize_reasoning_effort(reasoning_effort)
 
@@ -193,39 +269,54 @@ class LLMClient:
             kwargs["tools"] = tools_with_cache
             kwargs["tool_choice"] = tool_choice
 
-        resp = client.chat.completions.create(**kwargs)
-        resp_dict = resp.model_dump()
-        usage = resp_dict.get("usage") or {}
-        choices = resp_dict.get("choices") or [{}]
-        msg = (choices[0] if choices else {}).get("message") or {}
+        # Exponential backoff for failed calls
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                resp = client.chat.completions.create(**kwargs)
+                resp_dict = resp.model_dump()
+                usage = resp_dict.get("usage") or {}
+                choices = resp_dict.get("choices") or [{}]
+                msg = (choices[0] if choices else {}).get("message") or {}
 
-        # Extract cached_tokens from prompt_tokens_details if available
-        if not usage.get("cached_tokens"):
-            prompt_details = usage.get("prompt_tokens_details") or {}
-            if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
-                usage["cached_tokens"] = int(prompt_details["cached_tokens"])
+                # Extract cached_tokens from prompt_tokens_details if available
+                if not usage.get("cached_tokens"):
+                    prompt_details = usage.get("prompt_tokens_details") or {}
+                    if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
+                        usage["cached_tokens"] = int(prompt_details["cached_tokens"])
 
-        # Extract cache_write_tokens from prompt_tokens_details if available
-        # OpenRouter: "cache_write_tokens"
-        # Native Anthropic: "cache_creation_tokens" or "cache_creation_input_tokens"
-        if not usage.get("cache_write_tokens"):
-            prompt_details_for_write = usage.get("prompt_tokens_details") or {}
-            if isinstance(prompt_details_for_write, dict):
-                cache_write = (prompt_details_for_write.get("cache_write_tokens")
-                              or prompt_details_for_write.get("cache_creation_tokens")
-                              or prompt_details_for_write.get("cache_creation_input_tokens"))
-                if cache_write:
-                    usage["cache_write_tokens"] = int(cache_write)
+                # Extract cache_write_tokens from prompt_tokens_details if available
+                if not usage.get("cache_write_tokens"):
+                    prompt_details_for_write = usage.get("prompt_tokens_details") or {}
+                    if isinstance(prompt_details_for_write, dict):
+                        cache_write = (prompt_details_for_write.get("cache_write_tokens")
+                                      or prompt_details_for_write.get("cache_creation_tokens")
+                                      or prompt_details_for_write.get("cache_creation_input_tokens"))
+                        if cache_write:
+                            usage["cache_write_tokens"] = int(cache_write)
 
-        # Ensure cost is present in usage (OpenRouter includes it, but fallback if missing)
-        if not usage.get("cost"):
-            gen_id = resp_dict.get("id") or ""
-            if gen_id:
-                cost = self._fetch_generation_cost(gen_id)
-                if cost is not None:
-                    usage["cost"] = cost
+                # Ensure cost is present in usage (OpenRouter includes it, but fallback if missing)
+                if not usage.get("cost"):
+                    gen_id = resp_dict.get("id") or ""
+                    if gen_id:
+                        cost = self._fetch_generation_cost(gen_id)
+                        if cost is not None:
+                            usage["cost"] = cost
 
-        return msg, usage
+                # Check if budget is exhausted after this call
+                if usage.get("cost") and not self.budget_tracker.update(float(usage["cost"])):
+                    log.warning("Budget exhausted. Cannot continue with paid models.")
+                    # Force survival mode for next calls
+                    self.budget_tracker.budget_remaining = 0.0
+
+                return msg, usage
+                
+            except Exception as e:
+                log.warning(f"Chat call failed (attempt {attempt + 1}/{max_attempts}): {e}")
+                if attempt < max_attempts - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    raise
 
     def vision_query(
         self,
